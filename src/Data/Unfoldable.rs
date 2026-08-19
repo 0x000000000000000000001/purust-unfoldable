@@ -11,18 +11,15 @@ pub fn Data_Unfoldable_unfoldrArrayImpl(
     let mut result = Vec::new();
     let mut value = b;
     loop {
-        let maybe = f.call.as_ref().unwrap()(value);
-        let is_nothing_val = isNothing.call.as_ref().unwrap()(maybe.clone());
-        if is_nothing_val.init_bool.unwrap() {
+        let maybe = f.unwrap_func()(value);
+        let is_nothing_val = isNothing.unwrap_func()(maybe.clone());
+        if is_nothing_val.unwrap_bool() {
             break;
         }
-        let tuple = fromJust.call.as_ref().unwrap()(maybe);
-        let first = fst.call.as_ref().unwrap()(tuple.clone());
+        let tuple = fromJust.unwrap_func()(maybe);
+        let first = fst.unwrap_func()(tuple.clone());
         result.push(first);
-        value = snd.call.as_ref().unwrap()(tuple);
+        value = snd.unwrap_func()(tuple);
     }
-    crate::UnknownType::new(crate::Record_a {
-        init_array: Some(std::rc::Rc::new(result)),
-        ..Default::default()
-    })
+    crate::Value::Array(std::rc::Rc::new(result))
 }
