@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+CLEAN=0
+for arg in "$@"; do
+  case "$arg" in
+    -c|--clean) CLEAN=1 ;;
+    *) echo "Usage: bin/test [-c|--clean]" >&2; exit 2 ;;
+  esac
+done
+
+COMPILER_DIR="$(cd ../purust && pwd)"
+SPAGO_BIN="$COMPILER_DIR/node_modules/.bin/spago"
+if [ ! -x "$SPAGO_BIN" ]; then
+  printf 'Missing Spago dependency. Run npm install in %s.\n' "$COMPILER_DIR" >&2
+  exit 1
+fi
+if [ "$CLEAN" = 1 ]; then
+  echo "=== Recompiling purust ==="
+  (cd "$COMPILER_DIR" && npm run build)
+fi
+
+# Prefer the sibling TAST fork; PURS can select another build explicitly.
+if [ -n "${PURS:-}" ]; then
+  PURS_BIN="$(command -v "$PURS")"
+else
+  FORK_BUILDS=("$COMPILER_DIR"/../../purescript/.stack-work/dist/*/*/build/purs/purs)
+  if [ "${#FORK_BUILDS[@]}" = 1 ] && [ -x "${FORK_BUILDS[0]}" ]; then
+    PURS_BIN="${FORK_BUILDS[0]}"
+  else
+    PURS_BIN="$(command -v purs)"
+  fi
+fi
+export PATH="$(dirname "$PURS_BIN"):$PATH"
+
+# Clean this package only. Always regenerate its TAST and Rust output.
+rm -rf output
+if [ "$CLEAN" = 1 ]; then
+  rm -rf .spago .cache
+fi
+
+echo "=== Building TAST and generating Rust with spago ==="
+"$SPAGO_BIN" build
+node -e 'const fs = require("node:fs"); const m = JSON.parse(fs.readFileSync("output/Test.Main/corefn.json", "utf8")); if (!Array.isArray(m.dataDecls)) { console.error("A TAST-enabled PureScript fork is required; set PURS to its executable."); process.exit(1); }'
+
+echo "=== Compiling Rust FFI and tests ==="
+cargo build --manifest-path output/purust_output/Cargo.toml
+
+echo "=== Running Unfoldable tests ==="
+BINARY="output/purust_output/target/debug/purust_output"
+status=0
+"$BINARY" > output/actual.stdout 2> output/actual.stderr || status=$?
+cat output/actual.stdout
+if [ "$status" -ne 0 ] || [ -s output/actual.stderr ]; then
+  cat output/actual.stderr >&2
+  echo "[FAILED] Unfoldable tests exited with status $status" >&2
+  exit 1
+fi
+diff -u test/expected.stdout output/actual.stdout
+
+echo "=== Checking native FFI step counts in Rc and Arc ==="
+NATIVE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/purust-unfoldable.XXXXXX")"
+trap 'rm -rf "$NATIVE_DIR"' EXIT
+
+# Reuse the compiler's Rust ownership transformation for the same Rust tests in
+# both modes. Compilation and execution remain ordinary Bash/rustc operations.
+node --input-type=module - "$NATIVE_DIR" "$PWD" "$COMPILER_DIR" <<'JS'
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const [directory, root, compiler] = process.argv.slice(2);
+const { threadedRust, threadedPrelude } = await import(pathToFileURL(join(compiler, 'src/Purust/Threading.js')));
+const read = path => readFileSync(join(root, path), 'utf8');
+const prelude = read('output/purust_output/purust_core/src/lib.rs');
+const runtime = join(compiler, 'tests/runtime/perceus_ptr/src/lib.rs');
+const prefix = `extern crate self as purust_core;\n#[path = ${JSON.stringify(runtime)}] mod perceus_ptr;\n`;
+const probes = [
+  ['ffi', ['src/Data/Unfoldable.rs', 'src/Data/Unfoldable1.rs']],
+  ['nonempty-traversal', ['../purust-arrays/src/Data/Array/NonEmpty/Internal.rs',
+    '../purust-prelude/src/Control/Apply.rs', '../purust-prelude/src/Data/Functor.rs']],
+];
+for (const [name, foreign] of probes) {
+  const body = prefix + foreign.map(read).join('\n') + read(`test/${name}.rs`);
+  writeFileSync(join(directory, `${name}-local.rs`), prelude + body);
+  writeFileSync(join(directory, `${name}-threaded.rs`), threadedPrelude(prelude) + threadedRust(body));
+}
+JS
+
+for mode in local threaded; do
+  RUST_FLAGS=(--edition=2021 -Awarnings --crate-name unfoldable_probe)
+  if [ "$mode" = threaded ]; then
+    RUST_FLAGS+=(--cfg 'feature="threaded"')
+  fi
+  for probe in ffi nonempty-traversal; do
+    rustc "${RUST_FLAGS[@]}" \
+      "$NATIVE_DIR/$probe-$mode.rs" -o "$NATIVE_DIR/$probe-$mode"
+    "$NATIVE_DIR/$probe-$mode"
+    printf '[OK] %s (%s)\n' "$probe" "$mode"
+  done
+done
+echo "Summary: 17 unchanged upstream assertions, 7 integration groups and native FFI checks passed."
